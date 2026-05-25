@@ -251,7 +251,7 @@ class NeighborAttentionValuePolicyNet(nn.Module):
         self.use_neighbors = config.max_neighbors > 0 and config.neighbor_mode != "none"
         if self.use_neighbors:
             self.attn = nn.MultiheadAttention(config.d_model, num_heads=2, dropout=config.dropout, batch_first=True)
-        base_feat_dim = config.d_model * (3 if self.use_neighbors else 1) + 7
+        base_feat_dim = config.d_model * (4 if self.use_neighbors else 1) + 7
         if config.use_gap_feature:
             base_feat_dim += 1
         self.fuse = nn.Sequential(
