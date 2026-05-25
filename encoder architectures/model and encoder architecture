@@ -1,0 +1,351 @@
+@dataclass(frozen=True)
+class ModelConfig:
+    n: int = 45
+    d_model: int = 256
+    depth: int = 2
+    dropout: float = 0.05
+    max_neighbors: int = 44
+    neighbor_mode: str = "sampled"
+    use_gap_feature: bool = False
+    use_policy_head: bool = True
+    fourier_bands: int = 4
+    random_proj_dim: int = 16
+    local_kernel_size: int = 3
+    use_local_mixing: bool = True
+    use_pyg_attn_pool: bool = True
+    use_gated_pooling: bool = True
+    encoder_preset: str = "full"
+
+ABLATION_PRESETS = [
+    "base", "+base", "+fourier", "+proj", "+local", "+pool", "+blocks", "full",
+]
+
+def get_config_for_preset(preset: str, n: int = 45, d_model: int = 256) -> ModelConfig:
+    if preset not in ABLATION_PRESETS:
+        raise ValueError(f"Unknown preset: {preset}. Available: {ABLATION_PRESETS}")
+    return ModelConfig(
+        n=n, d_model=d_model, depth=2, dropout=0.05,
+        max_neighbors=44, neighbor_mode="sampled",
+        use_gap_feature=False, use_policy_head=True,
+        fourier_bands=4, random_proj_dim=16, local_kernel_size=3,
+        use_local_mixing=True, use_pyg_attn_pool=True, use_gated_pooling=True,
+        encoder_preset=preset,
+    )
+
+# ============================================================================
+# 🧱 ModularStateEncoder
+# ============================================================================
+
+class MeanPooling(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=1)
+
+class GatedMeanPooling(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.gate = nn.Linear(d_model, 1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        g = torch.sigmoid(self.gate(x))
+        weighted = x * g
+        return weighted.sum(dim=1) / g.sum(dim=1).clamp_min(1e-6)
+
+class AttentionPooling(nn.Module):
+    def __init__(self, d_model: int, num_heads: int = 2):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.query_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b = x.shape[0]
+        query = self.query_token.expand(b, -1, -1)
+        out, _ = self.attn(query, x, x, need_weights=False)
+        return out.squeeze(1)
+
+def build_base_features(values: torch.Tensor, positions: torch.Tensor, n: int) -> torch.Tensor:
+    b = values.shape[0]
+    denom = float(max(1, n))
+    fill_val = -float(n)
+    def safe_shift(x: torch.Tensor, shift: int) -> torch.Tensor:
+        if shift > 0:
+            return torch.cat([torch.full((b, shift), fill_val, device=x.device), x[:, :-shift]], dim=1)
+        elif shift < 0:
+            return torch.cat([x[:, -shift:], torch.full((b, -shift), fill_val, device=x.device)], dim=1)
+        return x
+    left, right = safe_shift(values, 1), safe_shift(values, -1)
+    third = float(max(1, math.ceil(n / 3)))
+    v3 = torch.floor(values / third).clamp(0, 2)
+    p3 = torch.floor(positions / third).clamp(0, 2)
+    edge_l = (positions == 0).float()
+    edge_r = (positions == n - 1).float()
+    return torch.stack([
+        values/denom, positions/denom,
+        torch.abs(values-positions)/denom, (values-positions)/denom,
+        torch.abs(values-left).clamp_max(n)/denom,
+        torch.abs(values-right).clamp_max(n)/denom,
+        (torch.abs(values-left)!=1).float(),
+        (torch.abs(values-right)!=1).float(),
+        (values==positions).float(),
+        v3/2, p3/2, (v3==p3).float(),
+        edge_l, edge_r,
+    ], dim=-1)
+
+def build_fourier_features(values: torch.Tensor, positions: torch.Tensor, n: int, bands: int = 4) -> torch.Tensor:
+    vp = torch.stack([values, positions, values-positions], dim=-1) / float(max(1, n))
+    freqs = 2.0 ** torch.arange(bands, device=values.device, dtype=torch.float32)
+    angles = 2.0 * math.pi * vp.unsqueeze(-1) * freqs.view(1, 1, 1, -1)
+    fourier = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    return fourier.flatten(-2)
+
+def build_random_projection_sketch(values: torch.Tensor, positions: torch.Tensor, n: int, proj_dim: int = 16, seed: int = 42) -> torch.Tensor:
+    generator = torch.Generator(device=values.device)
+    generator.manual_seed(seed + n * 1000)
+    rand_proj = torch.randn(3, proj_dim, device=values.device, generator=generator) / math.sqrt(3.0)
+    vp = torch.stack([values, positions, values-positions], dim=-1) / float(max(1, n))
+    return torch.tanh(vp @ rand_proj)
+
+class ModularStateEncoder(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.n = config.n
+        self.d_model = config.d_model
+        preset = config.encoder_preset
+        is_base = (preset == "base")
+        self.use_base_features = preset in ("+base", "+fourier", "+proj", "+local", "+pool", "+blocks", "full")
+        self.use_fourier = preset in ("+fourier", "+proj", "+local", "+pool", "+blocks", "full")
+        self.use_random_proj = preset in ("+proj", "+local", "+pool", "+blocks", "full")
+        self.use_local_mixing = config.use_local_mixing and preset != "base"
+        self.use_gated_pool = config.use_gated_pooling and preset in ("+pool", "+blocks", "full")
+        self.use_pyg_pool = config.use_pyg_attn_pool and HAS_PYG and preset in ("+pool", "+blocks", "full")
+        self.use_post_blocks = config.depth > 0 and preset in ("+blocks", "full")
+        feat_dim = 0
+        if is_base:
+            self.pos_emb = nn.Embedding(config.n + 10, config.d_model)
+            feat_dim = config.d_model
+        else:
+            if self.use_base_features: feat_dim += 14
+            if self.use_fourier: feat_dim += 6 * config.fourier_bands
+            if self.use_random_proj: feat_dim += config.random_proj_dim
+            if feat_dim == 0:
+                self.pos_emb = nn.Embedding(config.n + 10, config.d_model // 2)
+                feat_dim = config.d_model // 2
+        self.total_feat_dim = feat_dim
+        self.token_proj = nn.Sequential(
+            nn.Linear(self.total_feat_dim, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, config.d_model),
+        )
+        if self.use_local_mixing:
+            k = config.local_kernel_size
+            if k % 2 == 0: k += 1
+            self.local_mixer = nn.Conv1d(
+                config.d_model, config.d_model,
+                kernel_size=k, padding=k//2,
+                groups=config.d_model, bias=False
+            )
+        else:
+            self.local_mixer = None
+        if self.use_pyg_pool:
+            self.attn_pool = AttentionalAggregation(
+                gate_nn=nn.Sequential(
+                    nn.Linear(config.d_model, config.d_model),
+                    nn.GELU(),
+                    nn.Linear(config.d_model, 1),
+                )
+            )
+        elif self.use_gated_pool:
+            self.pool_gate = nn.Linear(config.d_model, 1)
+        else:
+            self.pool_gate = None
+        if self.use_post_blocks:
+            self.post_blocks = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(config.d_model),
+                    nn.Linear(config.d_model, 2 * config.d_model),
+                    nn.GELU(),
+                    nn.Dropout(config.dropout),
+                    nn.Linear(2 * config.d_model, config.d_model),
+                ) for _ in range(config.depth)
+            ])
+        else:
+            self.post_blocks = None
+        self.out_norm = nn.LayerNorm(config.d_model)
+        self.register_buffer("pos_idx", torch.arange(config.n + 10, dtype=torch.long), persistent=False)
+    
+    def _build_features(self, x: torch.Tensor) -> torch.Tensor:
+        b, n = x.shape
+        values = x.float()
+        positions = self.pos_idx[:n].unsqueeze(0).expand(b, -1)
+        if self.config.encoder_preset == "base":
+            return self.pos_emb(positions)
+        features = []
+        denom = float(max(1, n))
+        fill_val = -float(n)
+        if self.use_base_features:
+            def shift(t, s):
+                if s > 0: return torch.cat([torch.full((b,s), fill_val, device=t.device), t[:,:-s]], 1)
+                elif s < 0: return torch.cat([t[:,-s:], torch.full((b,-s), fill_val, device=t.device)], 1)
+                return t
+            left, right = shift(values, 1), shift(values, -1)
+            third = float(max(1, math.ceil(n/3)))
+            v3, p3 = torch.floor(values/third).clamp(0,2), torch.floor(positions/third).clamp(0,2)
+            edge_l, edge_r = (positions==0).float(), (positions==n-1).float()
+            base = torch.stack([
+                values/denom, positions/denom,
+                torch.abs(values-positions)/denom, (values-positions)/denom,
+                torch.abs(values-left).clamp_max(n)/denom,
+                torch.abs(values-right).clamp_max(n)/denom,
+                (torch.abs(values-left)!=1).float(),
+                (torch.abs(values-right)!=1).float(),
+                (values==positions).float(),
+                v3/2, p3/2, (v3==p3).float(),
+                edge_l, edge_r,
+            ], dim=-1)
+            features.append(base)
+        if self.use_fourier:
+            vp = torch.stack([values, positions, values-positions], dim=-1) / denom
+            bands = 2.0 ** torch.arange(self.config.fourier_bands, device=x.device, dtype=torch.float32)
+            ang = 2*math.pi * vp.unsqueeze(-1) * bands.view(1,1,1,-1)
+            fourier = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1).flatten(-2)
+            features.append(fourier)
+        if self.use_random_proj:
+            vp = torch.stack([values, positions, values-positions], dim=-1) / denom
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(42 + n * 1000)
+            proj = torch.randn(3, self.config.random_proj_dim, device=x.device, generator=generator) / math.sqrt(3)
+            sketch = torch.tanh(vp @ proj)
+            features.append(sketch)
+        return torch.cat(features, dim=-1)
+    
+    def _pool(self, h: torch.Tensor) -> torch.Tensor:
+        b, n, d = h.shape
+        if self.use_pyg_pool and HAS_PYG:
+            batch_idx = torch.arange(b, device=h.device).view(-1,1).expand(-1,n).reshape(-1)
+            return self.attn_pool(h.reshape(b*n, d), batch_idx)
+        if self.pool_gate is not None:
+            g = torch.sigmoid(self.pool_gate(h))
+            return (h * g).sum(dim=1) / g.sum(dim=1).clamp_min(1e-6)
+        return h.mean(dim=1)
+    
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        x = as_batched_long(states, n=self.n, device=next(self.parameters()).device)
+        feats = self._build_features(x)
+        h = self.token_proj(feats)
+        if self.local_mixer is not None:
+            h = h + self.local_mixer(h.transpose(1,2)).transpose(1,2)
+        z = self._pool(h)
+        if self.post_blocks is not None:
+            for block in self.post_blocks:
+                z = z + block(z)
+        return self.out_norm(z)
+
+# ============================================================================
+# 🤖 NeighborAttentionValuePolicyNet
+# ============================================================================
+
+class NeighborAttentionValuePolicyNet(nn.Module):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.encoder = ModularStateEncoder(config)
+        self.use_neighbors = config.max_neighbors > 0 and config.neighbor_mode != "none"
+        if self.use_neighbors:
+            self.attn = nn.MultiheadAttention(config.d_model, num_heads=2, dropout=config.dropout, batch_first=True)
+        base_feat_dim = config.d_model * (3 if self.use_neighbors else 1) + 7
+        if config.use_gap_feature:
+            base_feat_dim += 1
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(base_feat_dim),
+            nn.Linear(base_feat_dim, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, 1),
+            
+        )
+        nn.init.constant_(self.value_head[-1].bias, math.log(math.exp(config.n) - 1))
+        self.policy_head = nn.Linear(config.d_model, max(1, config.n - 1)) if config.use_policy_head else None
+    
+    def _neighbor_context(self, x: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+        if not self.use_neighbors:
+            return torch.zeros_like(current)
+        budget = max(0, int(self.config.max_neighbors))
+        if budget <= 0:
+            return torch.zeros_like(current)
+        if self.config.neighbor_mode == "sampled":
+            actions = stratified_flip_actions(x.shape[0], x.shape[1], budget, device=x.device)
+            neighbors, _ = transition_sampled_neighbors(x, num_actions=budget, actions=actions)
+        else:
+            neighbors = pancake_neighbors(x, max_neighbors=budget, mode=self.config.neighbor_mode)
+        batch, n_neighbors, n = neighbors.shape
+        if n_neighbors == 0:
+            return torch.zeros_like(current)
+        emb = self.encoder(neighbors.reshape(batch * n_neighbors, n)).reshape(batch, n_neighbors, -1)
+        context, _ = self.attn(current.unsqueeze(1), emb, emb, need_weights=False)
+        return context.squeeze(1)
+    
+    def features(self, states: torch.Tensor, gap_feature: torch.Tensor | None = None, *, use_neighbors: bool = True) -> torch.Tensor:
+        x = as_batched_long(states, device=next(self.parameters()).device, n=self.config.n)
+        current = self.encoder(x)
+        context = self._neighbor_context(x, current) if (use_neighbors and self.use_neighbors) else torch.zeros_like(current)
+        n = x.shape[1]
+        values = x.float()
+        pos = torch.arange(n, device=x.device, dtype=torch.float32).view(1, n)
+        exact_pos = (values == pos).float()
+        prefix_exact = torch.cumprod(exact_pos, dim=1).mean(dim=1)
+        suffix_exact = torch.flip(torch.cumprod(torch.flip(exact_pos, dims=[1]), dim=1), dims=[1]).mean(dim=1)
+        adj_sorted = (torch.abs(values[:, 1:] - values[:, :-1]) == 1).float()
+        prefix_adj = torch.cumprod(adj_sorted, dim=1).mean(dim=1) if n > 1 else torch.ones(x.shape[0], device=x.device)
+        suffix_adj = torch.flip(torch.cumprod(torch.flip(adj_sorted, dims=[1]), dim=1), dims=[1]).mean(dim=1) if n > 1 else torch.ones(x.shape[0], device=x.device)
+        scalar = torch.stack([
+            gap_heuristic(x).to(x.device) / float(n),
+            exact_pos.mean(dim=1),
+            is_goal(x, n).float().to(x.device),
+            prefix_exact, suffix_exact, prefix_adj, suffix_adj,
+        ], dim=1)
+        diff = current - context
+        # 🔥 Усиление: добавляем element-wise product для нелинейного взаимодействия
+        interaction = current * context
+        feats = torch.cat([current, context, diff, interaction, scalar], dim=-1)
+        if self.config.use_gap_feature and gap_feature is not None:
+            feats = torch.cat([feats, gap_feature.to(x.device).float().view(-1, 1) / float(n)], dim=-1)
+        return self.fuse(feats)
+    
+    def _heads(self, z: torch.Tensor, states: torch.Tensor, *, inference: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        value = self.value_head(z).squeeze(-1)
+        if inference:
+            value = value.clamp(min=0)  # ← Только при инференсе/поиске
+        if self.policy_head is None:
+            logits = torch.zeros(value.shape[0], max(1, self.config.n - 1), dtype=value.dtype, device=value.device)
+        else:
+            logits = self.policy_head(z)
+        goal_mask = is_goal(states, self.config.n).to(value.device)
+        value = torch.where(goal_mask, torch.zeros_like(value), value)
+        return value, logits
+    
+    def predict_all(self, states: torch.Tensor, gap_feature: torch.Tensor | None = None, *, use_neighbors: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        z = self.features(states, gap_feature=gap_feature, use_neighbors=use_neighbors)
+        return self._heads(z, states, inference=False)
+    
+    def forward(self, states: torch.Tensor, gap_feature: torch.Tensor | None = None, *, use_neighbors: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.predict_all(states, gap_feature=gap_feature, use_neighbors=use_neighbors)
+    
+    @torch.inference_mode()
+    def heuristic(self, states: torch.Tensor, *, amp: bool = True, use_neighbors: bool = True) -> torch.Tensor:
+        device = next(self.parameters()).device
+        x = as_batched_long(states, device=device, n=self.config.n)
+        enabled = bool(amp and device.type == "cuda")
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled):
+            # ← Вызываем _heads напрямую с inference=True
+            value, _ = self._heads(self.features(x, use_neighbors=use_neighbors), x, inference=True)
+        return value.float()    
+    @torch.inference_mode()
+    def policy_logits(self, states: torch.Tensor, *, amp: bool = True, use_neighbors: bool = True) -> torch.Tensor:
+        device = next(self.parameters()).device
+        enabled = bool(amp and device.type == "cuda")
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled):
+            _, logits = self.forward(as_batched_long(states, device=device, n=self.config.n), use_neighbors=use_neighbors)
+        return logits.float()
