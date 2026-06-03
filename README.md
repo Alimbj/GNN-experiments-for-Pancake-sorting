@@ -73,4 +73,4 @@ FINAL train_loss=... beam_success_rate=... average_solution_length=... gap_succe
 
 ## Notebook workflow
 
-Open any experiment file, edit constants such as `TRAIN_STEPS`, `BATCH_SIZE`, `BEAM_WIDTH`, `EVAL_EPISODES`, or `TDA_MODE`, then run the file. Defaults are intentionally small enough for debugging; increase them for research-grade benchmark runs on RTX 4060 8GB or Kaggle T4.
+Open any experiment file, edit constants such as `TRAIN_STEPS`, `BATCH_SIZE`, `BEAM_WIDTH`, `EVAL_EPISODES`, or `TDA_MODE`, then run the file. Defaults are intentionally small enough for debugging;  research-grade benchmark runs on RTX 4060 8GB or Kaggle T4.
